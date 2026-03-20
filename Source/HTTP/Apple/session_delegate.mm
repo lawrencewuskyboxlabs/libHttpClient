@@ -64,6 +64,8 @@ struct TaskContext
     {
         std::unique_lock<std::shared_mutex> uniqueLock(_taskContextsMutex);
         _taskContexts.erase([task taskIdentifier]);
+        
+        HC_TRACE_ERROR(HTTPCLIENT, "Task context erased for identifier %u", [task taskIdentifier]);
     }
     
     _completionHandler([[session configuration] timeoutIntervalForRequest], [task taskIdentifier], [task response], error);
@@ -170,6 +172,8 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend
     {
         std::unique_lock<std::shared_mutex> uniqueLock(_taskContextsMutex);
         _taskContexts.emplace([dataTask taskIdentifier], TaskContext{ ._call = call, ._downloadSize = [response expectedContentLength]});
+        
+        HC_TRACE_ERROR(HTTPCLIENT, "Task context emplaced for identifier %u", [dataTask taskIdentifier]);
     }
 }
 

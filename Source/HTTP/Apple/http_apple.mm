@@ -156,6 +156,9 @@ void AppleHttpSessionManager::CompletionHandler(uint32_t sessionTimeout, NSUInte
     
     if (error)
     {
+        const char *cstr = [[error description] UTF8String];
+        HC_TRACE_ERROR(HTTPCLIENT, "Task identifier %u ran into Error description %s", taskIdentifier, cstr);
+        
         uint32_t errorCode = static_cast<uint32_t>([error code]);
         HC_TRACE_ERROR(HTTPCLIENT, "HCHttpCallPerform [ID %u] error from NSURLRequest code: %u", HCHttpCallGetId(taskContext.m_call), errorCode);
         HRESULT errorResult = E_FAIL;
@@ -185,6 +188,10 @@ void AppleHttpSessionManager::CompletionHandler(uint32_t sessionTimeout, NSUInte
         char const* valueCString = [value cStringUsingEncoding:NSUTF8StringEncoding];
         HCHttpCallResponseSetHeader(taskContext.m_call, keyCString, valueCString);
     }
+    
+    HCTraceSetTraceToDebugger(true);
+    HCSettingsSetTraceLevel(HCTraceLevel::Verbose);
+    HC_TRACE_ERROR(HTTPCLIENT, "AppleHttp completion handler %s", taskContext.m_call->url.c_str());
 
     XAsyncComplete(taskContext.m_asyncBlock, S_OK, 0);
 }
@@ -250,6 +257,11 @@ HRESULT AppleHttpSessionManager::InitiateRequest(
     }
     
     StartTaskOnSession(call, asyncBlock, request);
+    
+    HCTraceSetTraceToDebugger(true);
+    HCSettingsSetTraceLevel(HCTraceLevel::Verbose);
+    HC_TRACE_ERROR(HTTPCLIENT, "AppleHttp request initiated %s", call->url.c_str());
+    
     return S_OK;
 }
 
