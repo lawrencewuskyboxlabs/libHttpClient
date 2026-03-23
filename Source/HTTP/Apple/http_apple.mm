@@ -20,6 +20,7 @@ struct AppleHttpTaskContext
 struct AppleHttpSession
 {
     NSURLSession* m_session;
+    SessionDelegate* m_delegate;
     std::unordered_map<NSUInteger, AppleHttpTaskContext> m_httpTaskContexts;
 };
 
@@ -32,11 +33,10 @@ public:
     ) noexcept;
     
 private:
-    std::shared_mutex m_httpSessionsMutex;
+    std::mutex m_httpSessionsMutex;
     std::unordered_map<uint32_t, AppleHttpSession> m_httpSessions;
     
     void StartTaskOnSession(HCCallHandle call, XAsyncBlock* asyncBlock, NSURLRequest* request);
-    HCCallHandle GetCallHandle(uint32_t sessionTimeout, NSUInteger taskIdentifier);
     void CompletionHandler(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse* response, NSError* error);
 };
 
@@ -50,82 +50,56 @@ void AppleHttpSessionManager::StartTaskOnSession(HCCallHandle call, XAsyncBlock*
     }
     
     {
-        std::unique_lock<std::shared_mutex> uniqueLock(m_httpSessionsMutex);
+        std::unique_lock<std::mutex> uniqueLock(m_httpSessionsMutex);
         
-        NSURLSession* session = nil;
         auto httpSessionIter = m_httpSessions.find(timeoutInSeconds);
-        if (httpSessionIter != m_httpSessions.end())
+        if (httpSessionIter == m_httpSessions.end())
         {
-            session = httpSessionIter->second.m_session;
-        }
-        else {
             NSURLSessionConfiguration* configuration = NSURLSessionConfiguration.ephemeralSessionConfiguration;
             [configuration setTimeoutIntervalForRequest:(NSTimeInterval)timeoutInSeconds];
             [configuration setTimeoutIntervalForResource:(NSTimeInterval)timeoutInSeconds];
             
             std::weak_ptr<AppleHttpSessionManager> weak_this = shared_from_this();
             
-            SessionDelegate* delegate = [SessionDelegate sessionDelegateWithCallHandleRetriever:^HCCallHandle(uint32_t sessionTimeout, NSUInteger taskIdentifier) {
-                if (auto me = weak_this.lock())
-                {
-                    return me->GetCallHandle(sessionTimeout, taskIdentifier);
-                }
-                else {
-                    return nullptr;
-                }
-            } andCompletionHandler:^(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse *response, NSError *error) {
+            SessionDelegate* delegate = [SessionDelegate sessionDelegateWithCompletionHandler:^(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse *response, NSError *error) {
                 if (auto me = weak_this.lock())
                 {
                     me->CompletionHandler(sessionTimeout, taskIdentifier, response, error);
                 }
             }];
+            NSURLSession* session = [NSURLSession sessionWithConfiguration:configuration delegate:delegate delegateQueue:nil];
             
-            session = [NSURLSession sessionWithConfiguration:configuration delegate:delegate delegateQueue:nil];
-            httpSessionIter = m_httpSessions.emplace(timeoutInSeconds, AppleHttpSession{ .m_session = session }).first;
+            httpSessionIter = m_httpSessions.emplace(timeoutInSeconds, AppleHttpSession{ .m_session = session, .m_delegate = delegate }).first;
         }
         
-        NSURLSessionTask* sessionTask = [session dataTaskWithRequest:request];
+        NSURLSessionTask* sessionTask = [httpSessionIter->second.m_session dataTaskWithRequest:request];
         NSUInteger taskIdentifier = [sessionTask taskIdentifier];
         
         if (httpSessionIter->second.m_httpTaskContexts.count(taskIdentifier) > 0)
         {
             HC_TRACE_ERROR(HTTPCLIENT, "Shared session with timeout %u already has task with identifier %u", timeoutInSeconds, taskIdentifier);
             [sessionTask cancel];
+            return;
         }
-        else
+        
+        bool delegateRegistered = [httpSessionIter->second.m_delegate registerContextForTask:taskIdentifier withCall:call];
+        if (!delegateRegistered)
         {
-            httpSessionIter->second.m_httpTaskContexts.emplace(taskIdentifier, AppleHttpTaskContext{ .m_call = call, .m_asyncBlock = asyncBlock });
-            [sessionTask resume];
+            HC_TRACE_ERROR(HTTPCLIENT, "Shared session with timeout %u failed to register task with identifier %u", timeoutInSeconds, taskIdentifier);
+            [sessionTask cancel];
+            return;
         }
+        
+        httpSessionIter->second.m_httpTaskContexts.emplace(taskIdentifier, AppleHttpTaskContext{ .m_call = call, .m_asyncBlock = asyncBlock });
+        [sessionTask resume];
     }
-}
-
-HCCallHandle AppleHttpSessionManager::GetCallHandle(uint32_t sessionTimeout, NSUInteger taskIdentifier)
-{
-    std::shared_lock<std::shared_mutex> sharedLock(m_httpSessionsMutex);
-    
-    auto httpSessionIter = m_httpSessions.find(sessionTimeout);
-    if (httpSessionIter == m_httpSessions.end())
-    {
-        HC_TRACE_ERROR(HTTPCLIENT, "No existing session with timeout %u", sessionTimeout);
-        return nullptr;
-    }
-    
-    auto taskContextIter = httpSessionIter->second.m_httpTaskContexts.find(taskIdentifier);
-    if (taskContextIter == httpSessionIter->second.m_httpTaskContexts.end())
-    {
-        HC_TRACE_ERROR(HTTPCLIENT, "No existing task context with identifier %u", taskIdentifier);
-        return nullptr;
-    }
-    
-    return taskContextIter->second.m_call;
 }
 
 void AppleHttpSessionManager::CompletionHandler(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse* response, NSError* error)
 {
     AppleHttpTaskContext taskContext;
     {
-        std::unique_lock<std::shared_mutex> uniqueLock(m_httpSessionsMutex);
+        std::unique_lock<std::mutex> uniqueLock(m_httpSessionsMutex);
         
         auto httpSessionIter = m_httpSessions.find(sessionTimeout);
         if (httpSessionIter == m_httpSessions.end())

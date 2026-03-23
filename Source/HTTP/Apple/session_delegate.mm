@@ -4,7 +4,6 @@
 #include "pch.h"
 #include <httpClient/httpProvider.h>
 #import "session_delegate.h"
-#include <shared_mutex>
 
 struct TaskContext
 {
@@ -14,16 +13,15 @@ struct TaskContext
 
 @implementation SessionDelegate
 {
-    HCCallHandle(^_callHandleRetriever)(uint32_t sessionTimeout, NSUInteger taskIdentifier);
     void(^_completionHandler)(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse* response, NSError* error);
     
-    std::shared_mutex _taskContextsMutex;
+    NSLock* _taskContextsLock;
     std::unordered_map<NSUInteger, TaskContext> _taskContexts;
 }
 
-+ (SessionDelegate*) sessionDelegateWithCallHandleRetriever:(HCCallHandle(^)(uint32_t sessionTimeout, NSUInteger taskIdentifier)) callRetriever andCompletionHandler:(void(^)(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse* response, NSError* error)) completionHandler
++ (SessionDelegate*) sessionDelegateWithCompletionHandler:(void(^)(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse* response, NSError* error)) completionHandler
 {
-    return [[SessionDelegate alloc] initWithCallHandleRetriever: callRetriever andCompletionHandler:completionHandler];
+    return [[SessionDelegate alloc] initWithCompletionHandler:completionHandler];
 }
 
 + (void) reportProgress:(HCCallHandle)call progressReportFunction:(HCHttpCallProgressReportFunction)progressReportFunction minimumInterval:(size_t)minimumInterval current:(size_t)current total:(size_t)total progressReportCallbackContext:(void*)progressReportCallbackContext lastProgressReport:(std::chrono::steady_clock::time_point*)lastProgressReport
@@ -48,12 +46,31 @@ struct TaskContext
     }
 }
 
-- (instancetype) initWithCallHandleRetriever:(HCCallHandle(^)(uint32_t sessionTimeout, NSUInteger taskIdentifier)) callRetriever andCompletionHandler:(void(^)(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse* response, NSError* error)) completionHandler
+- (bool) registerContextForTask:(NSUInteger)taskIdentifier withCall:(HCCallHandle)call
+{
+    bool registered = false;
+    {
+        [_taskContextsLock lock];
+        if (_taskContexts.find(taskIdentifier) == _taskContexts.end())
+        {
+            _taskContexts.emplace(taskIdentifier, TaskContext{ ._call = call });
+            registered = true;
+        }
+        else
+        {
+            HC_TRACE_ERROR_HR(HTTPCLIENT, "Task context already exists, cannot register for identifier %u", taskIdentifier);
+        }
+        [_taskContextsLock unlock];
+    }
+    return registered;
+}
+
+- (instancetype) initWithCompletionHandler:(void(^)(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse* response, NSError* error)) completionHandler
 {
     if (self = [super init])
     {
-        _callHandleRetriever = callRetriever;
         _completionHandler = completionHandler;
+        _taskContextsLock = [[NSLock alloc] init];
         return self;
     }
     return nil;
@@ -62,8 +79,9 @@ struct TaskContext
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error
 {
     {
-        std::unique_lock<std::shared_mutex> uniqueLock(_taskContextsMutex);
+        [_taskContextsLock lock];
         _taskContexts.erase([task taskIdentifier]);
+        [_taskContextsLock unlock];
     }
     
     _completionHandler([[session configuration] timeoutIntervalForRequest], [task taskIdentifier], [task response], error);
@@ -75,16 +93,23 @@ struct TaskContext
     void* context = nullptr;
     
     TaskContext taskContext;
+    bool hasContext = false;
     {
-        std::shared_lock<std::shared_mutex> sharedLock(_taskContextsMutex);
+        [_taskContextsLock lock];
         auto existingTaskContext = _taskContexts.find([task taskIdentifier]);
-        if (existingTaskContext == _taskContexts.end())
+        if (existingTaskContext != _taskContexts.end())
         {
-            HC_TRACE_ERROR(HTTPCLIENT, "Task context missing for identifier %u", [task taskIdentifier]);
-            [task cancel];
-            return;
+            hasContext = true;
+            taskContext = existingTaskContext->second;
         }
-        taskContext = existingTaskContext->second;
+        [_taskContextsLock unlock];
+    }
+    
+    if (!hasContext)
+    {
+        HC_TRACE_ERROR(HTTPCLIENT, "Task context missing for data of identifier %u", [task taskIdentifier]);
+        [task cancel];
+        return;
     }
     
     if (FAILED(HCHttpCallResponseGetResponseBodyWriteFunction(taskContext._call, &writeFunction, &context)) ||
@@ -139,17 +164,24 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend
     void* uploadProgressReportCallbackContext{};
     HCHttpCallProgressReportFunction uploadProgressReportFunction = nullptr;
     
-    HCCallHandle call;
+    HCCallHandle call = nullptr;
+    bool hasContext = false;
     {
-        std::shared_lock<std::shared_mutex> sharedLock(_taskContextsMutex);
+        [_taskContextsLock lock];
         auto existingTaskContext = _taskContexts.find([task taskIdentifier]);
-        if (existingTaskContext == _taskContexts.end())
+        if (existingTaskContext != _taskContexts.end())
         {
-            HC_TRACE_ERROR(HTTPCLIENT, "Task context missing for identifier %u", [task taskIdentifier]);
-            [task cancel];
-            return;
+            hasContext = true;
+            call = existingTaskContext->second._call;
         }
-        call = existingTaskContext->second._call;
+        [_taskContextsLock unlock];
+    }
+    
+    if (!hasContext)
+    {
+        HC_TRACE_ERROR(HTTPCLIENT, "Task context missing for send report of identifier %u", [task taskIdentifier]);
+        [task cancel];
+        return;
     }
     
     HRESULT hr = HCHttpCallRequestGetProgressReportFunction(call, true, &uploadProgressReportFunction, &uploadMinimumProgressInterval, &uploadProgressReportCallbackContext);
@@ -162,14 +194,26 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend
     
 }
 
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveResponse:(NSURLResponse *)response completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler {
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveResponse:(NSURLResponse *)response completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler
+{
     completionHandler(NSURLSessionResponseAllow);
     
-    HCCallHandle call = _callHandleRetriever([[session configuration] timeoutIntervalForRequest], [dataTask taskIdentifier]);
-    
+    bool hasContext = false;
     {
-        std::unique_lock<std::shared_mutex> uniqueLock(_taskContextsMutex);
-        _taskContexts.emplace([dataTask taskIdentifier], TaskContext{ ._call = call, ._downloadSize = [response expectedContentLength]});
+        [_taskContextsLock lock];
+        auto existingTaskContext = _taskContexts.find([dataTask taskIdentifier]);
+        if (existingTaskContext != _taskContexts.end())
+        {
+            hasContext = true;
+            existingTaskContext->second._downloadSize = [response expectedContentLength];
+        }
+        [_taskContextsLock unlock];
+    }
+    
+    if (!hasContext)
+    {
+        HC_TRACE_ERROR(HTTPCLIENT, "Task context missing for response of identifier %u", [dataTask taskIdentifier]);
+        [dataTask cancel];
     }
 }
 
