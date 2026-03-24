@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <mutex>
 
 #include <httpClient/config.h>
 
@@ -494,3 +495,23 @@ enum class HCWebSocketCloseStatus : uint32_t
 };
 
 }
+
+// On some platforms, std::mutex default construction creates named mutexes which have a low
+// system-wide limit. DefaultUnnamedMutex forces unnamed mutex construction on affected platforms.
+// Define HC_USE_UNNAMED_MUTEX in your platform build props to enable the workaround.
+#if defined(HC_USE_UNNAMED_MUTEX)
+class DefaultUnnamedMutex : public std::mutex
+{
+public:
+    DefaultUnnamedMutex() noexcept : std::mutex(nullptr) {}
+    ~DefaultUnnamedMutex() noexcept = default;
+    DefaultUnnamedMutex(DefaultUnnamedMutex const&) = delete;
+    DefaultUnnamedMutex& operator=(DefaultUnnamedMutex const&) = delete;
+    void lock() { std::mutex::lock(); }
+    bool try_lock() { return std::mutex::try_lock(); }
+    void unlock() { std::mutex::unlock(); }
+    native_handle_type native_handle() { return std::mutex::native_handle(); }
+};
+#else
+using DefaultUnnamedMutex = std::mutex;
+#endif
