@@ -7,7 +7,6 @@
 #include "http_apple.h"
 #include "request_body_stream.h"
 #include "session_delegate.h"
-#include <shared_mutex>
 
 NAMESPACE_XBOX_HTTP_CLIENT_BEGIN
 
