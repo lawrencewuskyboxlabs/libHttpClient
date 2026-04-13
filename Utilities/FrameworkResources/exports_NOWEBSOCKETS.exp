@@ -140,3 +140,8 @@ _XTaskQueueRegisterMonitor
 _XTaskQueueUnregisterMonitor
 _XTaskQueueGetCurrentProcessTaskQueue
 _XTaskQueueSetCurrentProcessTaskQueue
+
+#
+# global.cpp
+#
+_g_traceHTTPCLIENT
