@@ -26,6 +26,9 @@ struct AppleHttpSession
 class AppleHttpSessionManager : public std::enable_shared_from_this<AppleHttpSessionManager>
 {
 public:
+    AppleHttpSessionManager() = default;
+    ~AppleHttpSessionManager();
+    
     HRESULT InitiateRequest(
         HCCallHandle call,
         XAsyncBlock *async
@@ -38,6 +41,16 @@ private:
     void StartTaskOnSession(HCCallHandle call, XAsyncBlock* asyncBlock, NSURLRequest* request);
     void CompletionHandler(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse* response, NSError* error);
 };
+
+AppleHttpSessionManager::~AppleHttpSessionManager()
+{
+    std::unique_lock<std::mutex> uniqueLock(m_httpSessionsMutex);
+    
+    for (auto it = m_httpSessions.begin(); it != m_httpSessions.end(); ++it)
+    {
+        [it->second.m_session finishTasksAndInvalidate];
+    }
+}
 
 void AppleHttpSessionManager::StartTaskOnSession(HCCallHandle call, XAsyncBlock* asyncBlock, NSURLRequest* request)
 {
@@ -76,7 +89,7 @@ void AppleHttpSessionManager::StartTaskOnSession(HCCallHandle call, XAsyncBlock*
         
         if (httpSessionIter->second.m_httpTaskContexts.count(taskIdentifier) > 0)
         {
-            HC_TRACE_ERROR(HTTPCLIENT, "Shared session with timeout %u already has task with identifier %u", timeoutInSeconds, taskIdentifier);
+            HC_TRACE_ERROR(HTTPCLIENT, "Shared session with timeout %u already has task with identifier %lu", timeoutInSeconds, taskIdentifier);
             [sessionTask cancel];
             return;
         }
@@ -84,7 +97,7 @@ void AppleHttpSessionManager::StartTaskOnSession(HCCallHandle call, XAsyncBlock*
         bool delegateRegistered = [httpSessionIter->second.m_delegate registerContextForTask:taskIdentifier withCall:call];
         if (!delegateRegistered)
         {
-            HC_TRACE_ERROR(HTTPCLIENT, "Shared session with timeout %u failed to register task with identifier %u", timeoutInSeconds, taskIdentifier);
+            HC_TRACE_ERROR(HTTPCLIENT, "Shared session with timeout %u failed to register task with identifier %lu", timeoutInSeconds, taskIdentifier);
             [sessionTask cancel];
             return;
         }
@@ -110,7 +123,7 @@ void AppleHttpSessionManager::CompletionHandler(uint32_t sessionTimeout, NSUInte
         auto taskContextIter = httpSessionIter->second.m_httpTaskContexts.find(taskIdentifier);
         if (taskContextIter == httpSessionIter->second.m_httpTaskContexts.end())
         {
-            HC_TRACE_ERROR(HTTPCLIENT, "No existing task context with identifier %u", taskIdentifier);
+            HC_TRACE_ERROR(HTTPCLIENT, "No existing task context with identifier %lu", taskIdentifier);
             return;
         }
         

@@ -15,7 +15,7 @@ struct TaskContext
 {
     void(^_completionHandler)(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse* response, NSError* error);
     
-    NSLock* _taskContextsLock;
+    std::mutex _taskContextsMutex;
     std::unordered_map<NSUInteger, TaskContext> _taskContexts;
 }
 
@@ -50,7 +50,8 @@ struct TaskContext
 {
     bool registered = false;
     {
-        [_taskContextsLock lock];
+        std::unique_lock<std::mutex> uniqueLock(_taskContextsMutex);
+        
         if (_taskContexts.find(taskIdentifier) == _taskContexts.end())
         {
             _taskContexts.emplace(taskIdentifier, TaskContext{ ._call = call });
@@ -58,9 +59,8 @@ struct TaskContext
         }
         else
         {
-            HC_TRACE_ERROR_HR(HTTPCLIENT, "Task context already exists, cannot register for identifier %u", taskIdentifier);
+            HC_TRACE_ERROR_HR(HTTPCLIENT, "Task context already exists, cannot register for identifier %lu", taskIdentifier);
         }
-        [_taskContextsLock unlock];
     }
     return registered;
 }
@@ -70,7 +70,6 @@ struct TaskContext
     if (self = [super init])
     {
         _completionHandler = completionHandler;
-        _taskContextsLock = [[NSLock alloc] init];
         return self;
     }
     return nil;
@@ -79,9 +78,8 @@ struct TaskContext
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error
 {
     {
-        [_taskContextsLock lock];
+        std::unique_lock<std::mutex> uniqueLock(_taskContextsMutex);
         _taskContexts.erase([task taskIdentifier]);
-        [_taskContextsLock unlock];
     }
     
     _completionHandler([[session configuration] timeoutIntervalForRequest], [task taskIdentifier], [task response], error);
@@ -95,19 +93,19 @@ struct TaskContext
     TaskContext taskContext;
     bool hasContext = false;
     {
-        [_taskContextsLock lock];
+        std::unique_lock<std::mutex> uniqueLock(_taskContextsMutex);
+        
         auto existingTaskContext = _taskContexts.find([task taskIdentifier]);
         if (existingTaskContext != _taskContexts.end())
         {
             hasContext = true;
             taskContext = existingTaskContext->second;
         }
-        [_taskContextsLock unlock];
     }
     
     if (!hasContext)
     {
-        HC_TRACE_ERROR(HTTPCLIENT, "Task context missing for data of identifier %u", [task taskIdentifier]);
+        HC_TRACE_ERROR(HTTPCLIENT, "Task context missing for data of identifier %lu", [task taskIdentifier]);
         [task cancel];
         return;
     }
@@ -167,19 +165,19 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend
     HCCallHandle call = nullptr;
     bool hasContext = false;
     {
-        [_taskContextsLock lock];
+        std::unique_lock<std::mutex> uniqueLock(_taskContextsMutex);
+        
         auto existingTaskContext = _taskContexts.find([task taskIdentifier]);
         if (existingTaskContext != _taskContexts.end())
         {
             hasContext = true;
             call = existingTaskContext->second._call;
         }
-        [_taskContextsLock unlock];
     }
     
     if (!hasContext)
     {
-        HC_TRACE_ERROR(HTTPCLIENT, "Task context missing for send report of identifier %u", [task taskIdentifier]);
+        HC_TRACE_ERROR(HTTPCLIENT, "Task context missing for send report of identifier %lu", [task taskIdentifier]);
         [task cancel];
         return;
     }
@@ -199,19 +197,19 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend
     
     bool hasContext = false;
     {
-        [_taskContextsLock lock];
+        std::unique_lock<std::mutex> uniqueLock(_taskContextsMutex);
+        
         auto existingTaskContext = _taskContexts.find([dataTask taskIdentifier]);
         if (existingTaskContext != _taskContexts.end())
         {
             hasContext = true;
             existingTaskContext->second._downloadSize = [response expectedContentLength];
         }
-        [_taskContextsLock unlock];
     }
     
     if (!hasContext)
     {
-        HC_TRACE_ERROR(HTTPCLIENT, "Task context missing for response of identifier %u", [dataTask taskIdentifier]);
+        HC_TRACE_ERROR(HTTPCLIENT, "Task context missing for response of identifier %lu", [dataTask taskIdentifier]);
         [dataTask cancel];
     }
 }
