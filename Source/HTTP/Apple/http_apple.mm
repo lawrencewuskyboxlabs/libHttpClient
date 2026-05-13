@@ -18,17 +18,46 @@ struct AppleHttpTaskContext
 
 struct AppleHttpSession
 {
+    AppleHttpSession(NSURLSession* session, SessionDelegate* delegate);
+    ~AppleHttpSession();
+    AppleHttpSession(AppleHttpSession&& other) noexcept;
+    AppleHttpSession(const AppleHttpSession& other) = delete;
+    AppleHttpSession& operator=(const AppleHttpSession& other) = delete;
+    
     NSURLSession* m_session;
     SessionDelegate* m_delegate;
     std::unordered_map<NSUInteger, AppleHttpTaskContext> m_httpTaskContexts;
 };
 
+AppleHttpSession::AppleHttpSession(NSURLSession* session, SessionDelegate* delegate)
+    : m_session(session),
+      m_delegate(delegate)
+{
+}
+
+AppleHttpSession::~AppleHttpSession()
+{
+    if (m_session != nil)
+    {
+        [m_session finishTasksAndInvalidate];
+        m_session = nil;
+    }
+    m_delegate = nil;
+}
+
+AppleHttpSession::AppleHttpSession(AppleHttpSession&& other) noexcept
+    : m_session(other.m_session),
+      m_delegate(other.m_delegate),
+      m_httpTaskContexts(std::move(other.m_httpTaskContexts))
+{
+    // Prevent session invalidation from other's destructor
+    other.m_session = nil;
+    other.m_delegate = nil;
+}
+
 class AppleHttpSessionManager : public std::enable_shared_from_this<AppleHttpSessionManager>
 {
 public:
-    AppleHttpSessionManager() = default;
-    ~AppleHttpSessionManager();
-    
     HRESULT InitiateRequest(
         HCCallHandle call,
         XAsyncBlock *async
@@ -42,16 +71,6 @@ private:
     void CompletionHandler(uint32_t sessionTimeout, NSUInteger taskIdentifier, NSURLResponse* response, NSError* error);
 };
 
-AppleHttpSessionManager::~AppleHttpSessionManager()
-{
-    std::unique_lock<std::mutex> uniqueLock(m_httpSessionsMutex);
-    
-    for (auto it = m_httpSessions.begin(); it != m_httpSessions.end(); ++it)
-    {
-        [it->second.m_session finishTasksAndInvalidate];
-    }
-}
-
 void AppleHttpSessionManager::StartTaskOnSession(HCCallHandle call, XAsyncBlock* asyncBlock, NSURLRequest* request)
 {
     uint32_t timeoutInSeconds = 0;
@@ -60,6 +79,9 @@ void AppleHttpSessionManager::StartTaskOnSession(HCCallHandle call, XAsyncBlock*
         // default to 60 to match other default ios behaviour
         timeoutInSeconds = 60;
     }
+    
+    NSURLSessionTask* sessionTask = nil;
+    bool canStartTask = false;
     
     {
         std::unique_lock<std::mutex> uniqueLock(m_httpSessionsMutex);
@@ -81,29 +103,41 @@ void AppleHttpSessionManager::StartTaskOnSession(HCCallHandle call, XAsyncBlock*
             }];
             NSURLSession* session = [NSURLSession sessionWithConfiguration:configuration delegate:delegate delegateQueue:nil];
             
-            httpSessionIter = m_httpSessions.emplace(timeoutInSeconds, AppleHttpSession{ .m_session = session, .m_delegate = delegate }).first;
+            httpSessionIter = m_httpSessions.emplace(timeoutInSeconds, AppleHttpSession{ session, delegate }).first;
         }
         
-        NSURLSessionTask* sessionTask = [httpSessionIter->second.m_session dataTaskWithRequest:request];
+        sessionTask = [httpSessionIter->second.m_session dataTaskWithRequest:request];
         NSUInteger taskIdentifier = [sessionTask taskIdentifier];
         
         if (httpSessionIter->second.m_httpTaskContexts.count(taskIdentifier) > 0)
         {
             HC_TRACE_ERROR(HTTPCLIENT, "Shared session with timeout %u already has task with identifier %lu", timeoutInSeconds, taskIdentifier);
-            [sessionTask cancel];
-            return;
         }
-        
-        bool delegateRegistered = [httpSessionIter->second.m_delegate registerContextForTask:taskIdentifier withCall:call];
-        if (!delegateRegistered)
+        else
         {
-            HC_TRACE_ERROR(HTTPCLIENT, "Shared session with timeout %u failed to register task with identifier %lu", timeoutInSeconds, taskIdentifier);
-            [sessionTask cancel];
-            return;
+            bool delegateRegistered = [httpSessionIter->second.m_delegate registerContextForTask:taskIdentifier withCall:call];
+            if (!delegateRegistered)
+            {
+                HC_TRACE_ERROR(HTTPCLIENT, "Shared session with timeout %u failed to register task with identifier %lu", timeoutInSeconds, taskIdentifier);
+            }
+            else
+            {
+                httpSessionIter->second.m_httpTaskContexts.emplace(taskIdentifier, AppleHttpTaskContext{ .m_call = call, .m_asyncBlock = asyncBlock });
+                canStartTask = true;
+            }
         }
-        
-        httpSessionIter->second.m_httpTaskContexts.emplace(taskIdentifier, AppleHttpTaskContext{ .m_call = call, .m_asyncBlock = asyncBlock });
-        [sessionTask resume];
+    }
+    
+    if (sessionTask != nil)
+    {
+        if (canStartTask)
+        {
+            [sessionTask resume];
+        }
+        else
+        {
+            [sessionTask cancel];
+        }
     }
 }
 
@@ -135,7 +169,6 @@ void AppleHttpSessionManager::CompletionHandler(uint32_t sessionTimeout, NSUInte
         }
         else
         {
-            [httpSessionIter->second.m_session finishTasksAndInvalidate];
             m_httpSessions.erase(httpSessionIter);
         }
     }
