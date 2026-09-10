@@ -509,6 +509,9 @@ private:
             return E_FAIL;
         }
 
+        const size_t maxMessageSize = m_hcWebsocketHandle->websocket->MaxReceiveBufferSize();
+        con->set_max_message_size(maxMessageSize);
+
         // Add any request headers specified by the user.
         for (const auto & header : headers)
         {

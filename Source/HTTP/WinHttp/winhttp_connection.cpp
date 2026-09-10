@@ -1671,14 +1671,32 @@ void WinHttpConnection::callback_websocket_status_read_complete(
             win32_cs_autolock autoCriticalSection(&pRequestContext->m_lock);
             pRequestContext->m_websocketReceiveBuffer.FinishWriteData(wsStatus->dwBytesTransferred);
 
-            // If the receive buffer is full & at max size, invoke client fragment handler with partial message
+            // If the receive buffer is full and the message still hasn't completed, close and report an error to match websocketpp behaviour
             readBufferFull = pRequestContext->m_websocketReceiveBuffer.GetBufferByteCount() >= pRequestContext->m_websocketHandle->websocket->MaxReceiveBufferSize();
+            if (readBufferFull)
+            {
+                pRequestContext->m_state = ConnectionState::WebSocketClosing;
+            }
         }
 
         if (readBufferFull)
         {
-            // Treat all message fragments as binary as they may not be null terminated
-            pRequestContext->WebSocketReadComplete(true, false);
+            if (pRequestContext->m_winHttpWebSocketExports.close)
+            {
+                const DWORD errorCode = pRequestContext->m_winHttpWebSocketExports.close(pRequestContext->m_hRequest, static_cast<USHORT>(HCWebSocketCloseStatus::TooLarge), nullptr, 0);
+                if (errorCode == ERROR_SUCCESS)
+                {
+                    HC_TRACE_INFORMATION(WEBSOCKET, "[WinHttp] WebSocket receive buffer full, closing connection with HCWebSocketCloseStatus::TooLarge");
+                    return;
+                }
+                else
+                {
+                    HC_TRACE_ERROR(WEBSOCKET, "[WinHttp] Websocket receive buffer full but WinHttpWebSocketClose failed: %lu", errorCode);
+                }
+            }
+
+            pRequestContext->on_websocket_disconnected(static_cast<USHORT>(HCWebSocketCloseStatus::TooLarge));
+            return;
         }
 
         pRequestContext->WebSocketReadAsync();
