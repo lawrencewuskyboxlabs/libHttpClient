@@ -1647,6 +1647,7 @@ void WinHttpConnection::callback_websocket_status_read_complete(
     _In_ void* statusInfo)
 {
 #ifndef HC_NOWEBSOCKETS
+    HC_TRACE_ERROR(HTTPCLIENT, "callback_websocket_status_read_complete");
     WINHTTP_WEB_SOCKET_STATUS* wsStatus = static_cast<WINHTTP_WEB_SOCKET_STATUS*>(statusInfo);
     if (wsStatus == nullptr)
     {
@@ -1654,6 +1655,10 @@ void WinHttpConnection::callback_websocket_status_read_complete(
     }
 
     HC_TRACE_INFORMATION(WEBSOCKET, "[WinHttp] callback_websocket_status_read_complete: buffer type %s", winhttp_web_socket_buffer_type_to_string(wsStatus->eBufferType));
+    
+	const bool receivedFragment = wsStatus->eBufferType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE || wsStatus->eBufferType == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE;
+	const bool receivedMessage = wsStatus->eBufferType == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE || wsStatus->eBufferType == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE;
+
     if (wsStatus->eBufferType == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE)
     {
         assert(pRequestContext->m_winHttpWebSocketExports.queryCloseStatus);
@@ -1664,22 +1669,25 @@ void WinHttpConnection::callback_websocket_status_read_complete(
 
         pRequestContext->on_websocket_disconnected(closeReason);
     }
-    else if (wsStatus->eBufferType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE || wsStatus->eBufferType == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE)
+    else if (receivedFragment || receivedMessage)
     {
-        bool readBufferFull{ false };
+        bool messageTooLarge{ false };
         {
             win32_cs_autolock autoCriticalSection(&pRequestContext->m_lock);
             pRequestContext->m_websocketReceiveBuffer.FinishWriteData(wsStatus->dwBytesTransferred);
 
-            // If the receive buffer is full and the message still hasn't completed, close and report an error to match websocketpp behaviour
-            readBufferFull = pRequestContext->m_websocketReceiveBuffer.GetBufferByteCount() >= pRequestContext->m_websocketHandle->websocket->MaxReceiveBufferSize();
-            if (readBufferFull)
+            const uint32_t currentBufferSize = pRequestContext->m_websocketReceiveBuffer.GetBufferByteCount();
+			const size_t maxReceiveBufferSize = pRequestContext->m_websocketHandle->websocket->MaxReceiveBufferSize();
+            // If the message size exceeds the specified max, close and report an error to match websocketpp behaviour
+            messageTooLarge = (receivedFragment && currentBufferSize >= maxReceiveBufferSize) || (receivedMessage && currentBufferSize > maxReceiveBufferSize);
+            if (messageTooLarge)
             {
+                HC_TRACE_ERROR(HTTPCLIENT, "Read buffer full");
                 pRequestContext->m_state = ConnectionState::WebSocketClosing;
             }
         }
 
-        if (readBufferFull)
+        if (messageTooLarge)
         {
             if (pRequestContext->m_winHttpWebSocketExports.close)
             {
@@ -1699,12 +1707,10 @@ void WinHttpConnection::callback_websocket_status_read_complete(
             return;
         }
 
-        pRequestContext->WebSocketReadAsync();
-    }
-    else if (wsStatus->eBufferType == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE || wsStatus->eBufferType == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE)
-    {
-        pRequestContext->m_websocketReceiveBuffer.FinishWriteData(wsStatus->dwBytesTransferred);
-        pRequestContext->WebSocketReadComplete(wsStatus->eBufferType == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, true);
+        if (receivedMessage)
+        {
+            pRequestContext->WebSocketReadComplete(wsStatus->eBufferType == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, true);
+        }
         pRequestContext->WebSocketReadAsync();
     }
 #else
